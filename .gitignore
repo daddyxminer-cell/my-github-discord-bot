@@ -1,0 +1,7 @@
+pearl-audit/
+
+# github bot
+github_bot/.env
+github_bot/state/seen.json*
+github_bot/state/bot.lock
+__pycache__/
