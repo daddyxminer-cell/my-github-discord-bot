@@ -1,0 +1,84 @@
+name: GitHub PoW project notifier
+
+# Searches GitHub for brand-new PoW / node-based crypto projects every hour and
+# posts each one to Discord ONCE. Needs the repo secret DISCORD_WEBHOOK_URL
+# (use a different webhook/channel than the Bitcointalk bot if you like).
+#
+# The bot's memory (seen.json) is kept on its own branch "github-bot-state".
+# If two runs ever overlap, both copies are MERGED (never overwritten).
+on:
+  schedule:
+    - cron: "7 * * * *"   # every hour at :07 (change to "*/30 * * * *" for every 30 min)
+  workflow_dispatch:
+
+concurrency:
+  group: github-pow-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  STATE_BRANCH: github-bot-state
+  STATE_DIR: github_bot/state
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r github_bot/requirements.txt
+
+      - name: Load bot memory from state branch
+        run: |
+          mkdir -p "$STATE_DIR"
+          if git fetch --depth=1 origin "$STATE_BRANCH" 2>/dev/null; then
+            git show "FETCH_HEAD:seen.json"     > "$STATE_DIR/seen.json"     2>/dev/null || rm -f "$STATE_DIR/seen.json"
+            git show "FETCH_HEAD:seen.json.bak" > "$STATE_DIR/seen.json.bak" 2>/dev/null || rm -f "$STATE_DIR/seen.json.bak"
+            echo "Loaded memory from $STATE_BRANCH"
+          else
+            echo "No state branch yet - first run will only remember current repos"
+          fi
+
+      - name: Search GitHub and notify Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL_GITHUB || secrets.DISCORD_WEBHOOK_URL }}
+          GITHUB_TOKEN: ${{ secrets.GH_SEARCH_TOKEN || github.token }}
+          BOT_NAME: ${{ vars.GITHUB_BOT_NAME || '' }}
+          MIN_SCORE: ${{ vars.MIN_SCORE || '7' }}
+          INCLUDE_NODE: ${{ vars.INCLUDE_NODE || 'true' }}
+          SHOW_DETAILS: ${{ vars.SHOW_DETAILS || 'false' }}
+        run: python github_bot/bot.py --once
+
+      - name: Save bot memory to state branch
+        if: always()
+        run: |
+          [ -f "$STATE_DIR/seen.json" ] || { echo "Nothing to save"; exit 0; }
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          WORK=$(mktemp -d)
+          for i in 1 2 3 4 5; do
+            rm -rf "$WORK" && mkdir -p "$WORK" && cd "$WORK" && git init -q
+            git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+            if git fetch -q --depth=1 origin "$STATE_BRANCH" 2>/dev/null; then
+              git checkout -q -B "$STATE_BRANCH" FETCH_HEAD
+              python "$GITHUB_WORKSPACE/github_bot/bot.py" --merge-state "$WORK/seen.json"
+            else
+              git checkout -q --orphan "$STATE_BRANCH"
+            fi
+            cp "$GITHUB_WORKSPACE/$STATE_DIR/seen.json" seen.json
+            [ -f "$GITHUB_WORKSPACE/$STATE_DIR/seen.json.bak" ] && cp "$GITHUB_WORKSPACE/$STATE_DIR/seen.json.bak" seen.json.bak
+            git add seen.json seen.json.bak 2>/dev/null || git add seen.json
+            if git diff --cached --quiet; then echo "No change"; exit 0; fi
+            git commit -q -m "github bot memory update [skip ci]"
+            if git push -q origin "HEAD:$STATE_BRANCH"; then echo "Saved"; exit 0; fi
+            echo "Push raced with another run, retrying ($i)"; sleep $((i * 3))
+          done
+          echo "::error::Could not save bot memory"; exit 1
